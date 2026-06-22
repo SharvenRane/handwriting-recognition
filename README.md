@@ -1,87 +1,101 @@
-# Handwriting Recognition
+# Handwriting Recognition with CRNN and CTC
 
-Handwritten text recognition with TrOCR fine-tuned on domain-specific handwriting
+A compact, self contained implementation of handwritten text recognition. It pairs
+a small convolutional recurrent network (CRNN) with the CTC loss so that the model
+can read a line of text without any per character bounding boxes. Everything runs
+on CPU and there is nothing to download. The handwriting images are generated in
+code, so the whole project is reproducible from a clean checkout.
 
-`handwriting` `ocr` `recognition` `trocr` `pytorch`
+## What is inside
 
-## Overview
+The pipeline has four real pieces that fit together the way a production OCR stack
+would, just shrunk down so it trains in seconds.
 
-This repository implements a complete pipeline for **handwriting recognition**, covering
-data preprocessing, model training, evaluation, and deployment.
+**Vocabulary.** `src/vocab.py` maps characters to integer ids. Id 0 is reserved for
+the CTC blank symbol and every real character starts at id 1. Encoding a string and
+decoding a list of ids back to text are exact inverses.
 
-## Features
+**Synthetic handwriting.** `src/data.py` renders short strings onto a fixed height
+grayscale canvas. Each supported character has its own stroke pattern defined in a
+tiny bitmap font, so two different strings always produce two different images. A
+light intensity wobble and a touch of noise make the renders look hand drawn rather
+than crisp, and the renderer is seeded so a given string and seed always produce the
+same image.
 
-- Clean, modular PyTorch implementation
-- Reproducible experiments with MLflow tracking
-- Comprehensive evaluation with standard benchmarks
-- ONNX export for production deployment
-- Detailed documentation and usage examples
+**CRNN.** `src/model.py` is the usual convolutional recurrent design. Convolutions
+reduce the image and pool the height down to a single row, which turns the width into
+a time axis. A bidirectional GRU reads that sequence and a linear head emits a class
+score at every timestep. The forward pass returns log probabilities shaped
+`(time, batch, classes)`, which is exactly what `nn.CTCLoss` and the greedy decoder
+expect.
 
-## Installation
+**CTC collapse and decoding.** `src/ctc.py` holds the deterministic half of CTC. The
+collapse rule runs in two steps and the order matters: first merge runs of repeated
+ids, then drop the blank. Collapsing repeats before removing blanks is what lets a
+genuine double letter like the two l characters in "hello" survive, because CTC keeps
+a blank between the two real characters so they do not merge into one.
 
-```bash
-git clone https://github.com/YOUR_USERNAME/handwriting-recognition.git
-cd handwriting-recognition
-pip install -r requirements.txt
-```
+## Training
 
-## Quick Start
+`src/train.py` wires the model to `nn.CTCLoss` and runs full batch gradient descent.
+The `train_overfit` helper trains on a tiny set until the model memorises it, then
+greedy decodes the predictions and hands back the recovered strings. This is the
+behaviour the tests lean on.
+
+A minimal run looks like this:
 
 ```python
-from src.model import Model
-from src.trainer import Trainer
-from src.config import Config
+from src.vocab import Vocabulary
+from src.data import make_dataset, supported_characters
+from src.model import CRNN
+from src.train import train_overfit
 
-config = Config.from_yaml("configs/default.yaml")
-model = Model(config)
-trainer = Trainer(model, config)
-trainer.train()
+vocab = Vocabulary(supported_characters())
+texts = ["cat", "dog", "fox"]
+images, targets, _ = make_dataset(texts, vocab, jitter=False)
+model = CRNN(num_classes=vocab.num_classes)
+decoded = train_overfit(model, images, targets, vocab, steps=400, lr=1e-2)
+print(decoded)  # ['cat', 'dog', 'fox']
 ```
 
-## Project Structure
+## Tests
+
+The test suite checks behaviour, not just shapes.
+
+* The CTC collapse is verified on known alignments, including the double letter case
+  where the blank is what keeps "hello" from collapsing to "helo".
+* The greedy decoder is checked against hand built logits whose argmax path is a known
+  alignment, in both single and batched form.
+* The renderer is checked for determinism, for distinct output on distinct strings, and
+  for correct padding when strings of different length share a batch.
+* The model is trained to overfit a small set and must decode its inputs back to the
+  exact target strings, which exercises the convolutions, the GRU, the CTC loss, and the
+  decoder end to end.
+
+Run them with:
 
 ```
-handwriting-recognition/
-├── src/
-│   ├── model.py        # Model architecture
-│   ├── dataset.py      # Data loading and preprocessing
-│   ├── trainer.py      # Training loop
-│   ├── evaluate.py     # Evaluation metrics
-│   └── utils.py        # Helper utilities
-├── configs/
-│   └── default.yaml    # Default configuration
-├── notebooks/
-│   └── exploration.ipynb
-├── tests/
-│   └── test_model.py
-├── requirements.txt
-└── README.md
+python -m pytest tests/ -q
 ```
 
-## Results
+On the development machine all 23 tests pass on CPU in roughly nine seconds.
 
-| Model | Dataset | Metric | Score |
-|-------|---------|--------|-------|
-| Baseline | Standard | Primary | - |
-| Ours | Standard | Primary | - |
+## Layout
 
-## Usage
-
-```bash
-# Train
-python train.py --config configs/default.yaml
-
-# Evaluate
-python evaluate.py --checkpoint checkpoints/best.pth
-
-# Export to ONNX
-python export.py --checkpoint checkpoints/best.pth
+```
+src/
+  vocab.py    character to id mapping with a reserved blank
+  data.py     synthetic handwriting renderer and batching
+  model.py    the CRNN
+  ctc.py      blank collapse and greedy decode
+  train.py    CTC training loop and the overfit helper
+tests/        pytest behaviour checks
 ```
 
-## References
+## Notes
 
-- Relevant papers and resources for handwriting recognition
-
-## License
-
-MIT
+The bitmap font is intentionally small and readable rather than realistic. It exists so
+the project stays offline and deterministic while still giving the model real strokes to
+learn from. Swapping in a richer renderer or a real handwriting dataset would not touch
+the model, the loss, or the decoder, since those operate on tensors and ids rather than
+on any particular image source.
